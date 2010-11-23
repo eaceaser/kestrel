@@ -20,9 +20,11 @@ package net.lag.kestrel
 import java.io._
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.channels.FileChannel
+import java.util.LinkedList
 import java.util.concurrent.CountDownLatch
 import com.twitter.actors.{Actor, TIMEOUT}
 import scala.collection.mutable
+import scala.collection.jcl.{LinkedList => JclLinkedList}
 import com.twitter.xrayspecs.Time
 import net.lag.configgy.{Config, Configgy, ConfigMap}
 import net.lag.logging.Logger
@@ -65,10 +67,7 @@ class PersistentQueue(persistencePath: String, val name: String,
   // # of items in the queue (including those not in memory)
   private var queueLength: Long = 0
 
-  private var queue = new mutable.Queue[QItem] {
-    // scala's Queue doesn't (yet?) have a way to put back.
-    def unget(item: QItem) = prependElem(item)
-  }
+  private val queue = new LinkedList[QItem]
   private var _memoryBytes: Long = 0
 
   private var closed = false
@@ -225,7 +224,7 @@ class PersistentQueue(persistencePath: String, val name: String,
       if (journal.size > maxJournalSize() * maxJournalOverflow() && queueSize < maxJournalSize()) {
         // force re-creation of the journal.
         log.info("Rolling journal file for '%s' (qsize=%d)", name, queueSize)
-        journal.roll(xidCounter, openTransactionIds map { openTransactions(_) }, queue)
+        journal.roll(xidCounter, openTransactionIds map { openTransactions(_) }, new JclLinkedList(queue))
       }
       if (queueSize >= maxMemorySize()) {
         log.info("Dropping to read-behind for queue '%s' (%d bytes)", name, queueSize)
@@ -437,7 +436,7 @@ class PersistentQueue(persistencePath: String, val name: String,
     // possible. this amortizes the disk overhead across all reads.
     while (keepJournal() && journal.inReadBehind && _memoryBytes < maxMemorySize()) {
       journal.fillReadBehind { item =>
-        queue += item
+        queue.add(item)
         _memoryBytes += item.data.length
       }
       if (!journal.inReadBehind) {
@@ -485,7 +484,7 @@ class PersistentQueue(persistencePath: String, val name: String,
   private def _add(item: QItem): Unit = {
     discardExpired(maxExpireSweep)
     if (!journal.inReadBehind) {
-      queue += item
+      queue.add(item)
       _memoryBytes += item.data.length
     }
     _totalItems += 1
@@ -495,7 +494,7 @@ class PersistentQueue(persistencePath: String, val name: String,
 
   private def _peek(): Option[QItem] = {
     discardExpired(maxExpireSweep)
-    if (queue.isEmpty) None else Some(queue.front)
+    if (queue.isEmpty) None else Some(queue.peek())
   }
 
   private def _remove(transaction: Boolean): Option[QItem] = {
@@ -503,7 +502,7 @@ class PersistentQueue(persistencePath: String, val name: String,
     if (queue.isEmpty) return None
 
     val now = Time.now.inMilliseconds
-    val item = queue.dequeue
+    val item = queue.poll()
     val len = item.data.length
     queueSize -= len
     _memoryBytes -= len
@@ -523,10 +522,10 @@ class PersistentQueue(persistencePath: String, val name: String,
     if (queue.isEmpty || journal.isReplaying || max <= 0) {
       0
     } else {
-      val realExpiry = adjustExpiry(queue.front.addTime, queue.front.expiry)
+      val realExpiry = adjustExpiry(queue.peekFirst().addTime, queue.peekFirst().expiry)
       if ((realExpiry != 0) && (realExpiry < Time.now.inMilliseconds)) {
         _totalExpired += 1
-        val item = queue.dequeue
+        val item = queue.poll()
         val len = item.data.length
         queueSize -= len
         _memoryBytes -= len
@@ -545,7 +544,7 @@ class PersistentQueue(persistencePath: String, val name: String,
     openTransactions.removeKey(xid) map { item =>
       queueLength += 1
       queueSize += item.data.length
-      queue unget item
+      queue.addFirst(item)
       _memoryBytes += item.data.length
     }
   }
